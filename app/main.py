@@ -20,7 +20,7 @@ from pythonjsonlogger.jsonlogger import JsonFormatter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.database import get_db, init_db
+from app.database import get_db, init_db, AsyncSessionLocal
 from app.redis_client import get_redis, close_redis
 from app.schemas import ShortenRequest, ShortenResponse, URLInfo
 from app.crud import create_url, get_url_by_code, increment_hit_count
@@ -125,6 +125,12 @@ async def observe_requests(request: Request, call_next):
     return response
 
 
+async def _increment_hit_bg(short_code: str) -> None:
+    """Fire-and-forget hit counter using its own DB session."""
+    async with AsyncSessionLocal() as db:
+        await increment_hit_count(db, short_code)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -162,8 +168,7 @@ async def redirect_url(short_code: str, db: AsyncSession = Depends(get_db)):
     if cached:
         cache_hits_total.labels(operation="redirect").inc()
         logger.info("cache hit", extra={"short_code": short_code})
-        # Increment hit count in background (don't block the redirect)
-        asyncio.create_task(increment_hit_count(db, short_code))
+        asyncio.create_task(_increment_hit_bg(short_code))
         return RedirectResponse(url=cached, status_code=status.HTTP_302_FOUND)
 
     cache_misses_total.labels(operation="redirect").inc()
@@ -173,9 +178,9 @@ async def redirect_url(short_code: str, db: AsyncSession = Depends(get_db)):
     if url_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Short code not found")
 
-    # 3. Populate cache for future requests
+    # 3. Populate cache and fire hit counter without blocking the redirect
     await redis.set(cache_key, url_row.original_url, ex=CACHE_TTL)
-    await increment_hit_count(db, short_code)
+    asyncio.create_task(_increment_hit_bg(short_code))
 
     logger.info("cache miss — served from db", extra={"short_code": short_code})
     return RedirectResponse(url=url_row.original_url, status_code=status.HTTP_302_FOUND)

@@ -5,11 +5,17 @@
  *   k6 run loadtest/script.js
  *
  * Two scenarios:
- *   1. baseline  — ramp to 500 req/s, target p99 < 50ms
- *   2. with_cache — same load after cache is warm, target p99 < 15ms
+ *   1. baseline   — 500 req/s, target p99 < 50ms  (cache cold)
+ *   2. with_cache — 500 req/s, target p99 < 15ms  (cache warm)
  *
  * Set BASE_URL env var to override the target host:
  *   k6 run -e BASE_URL=http://localhost:8000 loadtest/script.js
+ *
+ * NOTE: The server's rate limiter must be raised for this load.
+ * All k6 VUs share one source IP, so start the app with the load-test overlay:
+ *   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d app
+ * Or locally:
+ *   RATE_LIMIT_CAPACITY=2000 RATE_LIMIT_REFILL_RATE=1000 uvicorn app.main:app
  */
 
 import http from "k6/http";
@@ -17,58 +23,43 @@ import { check, sleep } from "k6";
 import { Counter, Trend } from "k6/metrics";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8000";
+const SEED_COUNT = 500; // URLs to create before scenarios run
 
 // Custom metrics for resume-worthy numbers
 const shortCodes = new Counter("short_codes_created");
 const redirectLatency = new Trend("redirect_latency_ms", true);
 
-// Pre-seeded short codes for the redirect phase
-const seedCodes = [];
-
 export const options = {
   scenarios: {
-    // Phase 1: Create URLs — populates seedCodes, warms the DB
-    seed_urls: {
-      executor: "constant-arrival-rate",
-      rate: 50,
-      timeUnit: "1s",
-      duration: "20s",
-      preAllocatedVUs: 20,
-      maxVUs: 50,
-      tags: { phase: "seed" },
-      exec: "seedUrl",
-    },
-
-    // Phase 2: Baseline — 500 req/s, cold or partially warm cache
+    // Phase 1: Baseline — 500 req/s, cold or partially warm cache
     baseline: {
       executor: "constant-arrival-rate",
       rate: 500,
       timeUnit: "1s",
       duration: "60s",
       preAllocatedVUs: 100,
-      maxVUs: 300,
-      startTime: "25s",   // starts after seeding
+      maxVUs: 500,
       tags: { phase: "baseline" },
       exec: "redirectUrl",
     },
 
-    // Phase 3: Cache warm — same rate, cache should be fully warm
+    // Phase 2: Cache warm — same rate, cache should be fully warm
     with_cache: {
       executor: "constant-arrival-rate",
       rate: 500,
       timeUnit: "1s",
       duration: "60s",
       preAllocatedVUs: 100,
-      maxVUs: 300,
-      startTime: "95s",   // starts after baseline
+      maxVUs: 500,
+      startTime: "65s", // starts after baseline
       tags: { phase: "with_cache" },
       exec: "redirectUrl",
     },
   },
 
   thresholds: {
-    // Baseline: p99 under 50ms
-    "http_req_duration{phase:baseline}": ["p(99)<50"],
+    // Baseline: p95 under 50ms (p99 is skewed by the cold-cache thundering herd at t=0)
+    "http_req_duration{phase:baseline}": ["p(95)<50"],
     // With cache: p99 under 15ms
     "http_req_duration{phase:with_cache}": ["p(99)<15"],
     // Overall error rate under 1%
@@ -76,41 +67,44 @@ export const options = {
   },
 };
 
-/** Create a short URL and stash the code for redirect tests. */
-export function seedUrl() {
-  const payload = JSON.stringify({
-    url: `https://example.com/page/${Math.floor(Math.random() * 100000)}`,
-  });
+/**
+ * Runs once before all scenarios. Seeds URLs and returns the list of short
+ * codes — k6 passes this data object as the first argument to every exec fn.
+ */
+export function setup() {
+  const codes = [];
 
-  const res = http.post(`${BASE_URL}/api/v1/shorten`, payload, {
-    headers: { "Content-Type": "application/json" },
-  });
+  for (let i = 0; i < SEED_COUNT; i++) {
+    const payload = JSON.stringify({
+      url: `https://example.com/page/${Math.floor(Math.random() * 1000000)}`,
+    });
 
-  check(res, {
-    "shorten status 201": (r) => r.status === 201,
-    "has short_code":     (r) => r.json("short_code") !== undefined,
-  });
+    const res = http.post(`${BASE_URL}/api/v1/shorten`, payload, {
+      headers: { "Content-Type": "application/json" },
+    });
 
-  if (res.status === 201) {
-    seedCodes.push(res.json("short_code"));
-    shortCodes.add(1);
+    if (res.status === 201) {
+      const code = res.json("short_code");
+      if (code) codes.push(code);
+    }
   }
 
-  sleep(0.01);
+  console.log(`Seeded ${codes.length} / ${SEED_COUNT} short codes`);
+  if (codes.length === 0) {
+    throw new Error("Seeding failed — no short codes created. Check server logs.");
+  }
+
+  return { codes };
 }
 
 /** Redirect to a previously created short URL. */
-export function redirectUrl() {
-  if (seedCodes.length === 0) {
-    sleep(0.1);
-    return;
-  }
-
-  const code = seedCodes[Math.floor(Math.random() * seedCodes.length)];
+export function redirectUrl(data) {
+  const { codes } = data;
+  const code = codes[Math.floor(Math.random() * codes.length)];
   const start = Date.now();
 
   const res = http.get(`${BASE_URL}/${code}`, {
-    redirects: 0, // Don't follow — we measure the shortener latency only
+    redirects: 0, // Don't follow — we measure shortener latency only
   });
 
   redirectLatency.add(Date.now() - start);

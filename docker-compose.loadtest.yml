@@ -1,0 +1,13 @@
+# Overlay for load testing — raises rate-limit ceiling so all k6 VUs
+# (which share one source IP) aren't throttled.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d app
+#   k6 run loadtest/script.js
+
+services:
+  app:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      - RATE_LIMIT_CAPACITY=2000
+      - RATE_LIMIT_REFILL_RATE=1000
