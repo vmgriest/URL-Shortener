@@ -182,6 +182,17 @@ docker compose down
 docker compose down -v
 ```
 
+### Troubleshooting: app fails to start with DNS error
+
+If `app-1` crashes on startup with `socket.gaierror: [Errno -2] Name or service not known`, the app container can't resolve the `postgres` hostname. This happens when stale containers from a previous run are left on a different Docker network.
+
+Fix with a clean restart:
+
+```bash
+docker compose down --remove-orphans
+docker compose up --build
+```
+
 ---
 
 ## API
