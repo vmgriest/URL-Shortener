@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>URL Shortener</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 16px;
+      padding: 2.5rem;
+      width: 100%;
+      max-width: 560px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      margin-bottom: 0.4rem;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .subtitle {
+      font-size: 0.875rem;
+      color: #64748b;
+      margin-bottom: 2rem;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    input[type="url"] {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      color: #e2e8f0;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input[type="url"]::placeholder { color: #475569; }
+    input[type="url"]:focus { border-color: #6366f1; }
+
+    button.primary {
+      padding: 0.75rem 1.4rem;
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.2s;
+    }
+
+    button.primary:hover { opacity: 0.88; }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .result {
+      margin-top: 1.5rem;
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 10px;
+      padding: 1rem 1.2rem;
+      display: none;
+    }
+
+    .result-label {
+      font-size: 0.75rem;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+
+    .result-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .short-link {
+      flex: 1;
+      font-size: 0.95rem;
+      color: #818cf8;
+      text-decoration: none;
+      word-break: break-all;
+    }
+
+    .short-link:hover { text-decoration: underline; }
+
+    button.copy {
+      padding: 0.4rem 0.9rem;
+      background: #2d3148;
+      border: 1px solid #3d4268;
+      border-radius: 7px;
+      color: #e2e8f0;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+
+    button.copy:hover { background: #3d4268; }
+    button.copy.copied { color: #4ade80; border-color: #4ade80; }
+
+    .error {
+      margin-top: 1rem;
+      padding: 0.75rem 1rem;
+      background: rgba(239,68,68,0.1);
+      border: 1px solid rgba(239,68,68,0.3);
+      border-radius: 8px;
+      color: #f87171;
+      font-size: 0.875rem;
+      display: none;
+    }
+
+    .history {
+      margin-top: 2rem;
+    }
+
+    .history-title {
+      font-size: 0.75rem;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.75rem;
+    }
+
+    .history-item {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.6rem 0;
+      border-bottom: 1px solid #1e2235;
+      font-size: 0.85rem;
+    }
+
+    .history-item:last-child { border-bottom: none; }
+
+    .history-original {
+      flex: 1;
+      color: #64748b;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .history-short {
+      color: #818cf8;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .history-short:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>URL Shortener</h1>
+    <p class="subtitle">Paste a long URL and get a short link instantly.</p>
+
+    <div class="input-row">
+      <input type="url" id="url-input" placeholder="https://example.com/very/long/url" />
+      <button class="primary" id="shorten-btn" onclick="shorten()">Shorten</button>
+    </div>
+
+    <div class="error" id="error"></div>
+
+    <div class="result" id="result">
+      <div class="result-label">Your short link</div>
+      <div class="result-row">
+        <a class="short-link" id="short-link" href="#" target="_blank"></a>
+        <button class="copy" id="copy-btn" onclick="copy()">Copy</button>
+      </div>
+    </div>
+
+    <div class="history" id="history" style="display:none">
+      <div class="history-title">Recent links</div>
+      <div id="history-list"></div>
+    </div>
+  </div>
+
+  <script>
+    const history = [];
+
+    async function shorten() {
+      const input = document.getElementById('url-input');
+      const btn = document.getElementById('shorten-btn');
+      const errorEl = document.getElementById('error');
+      const resultEl = document.getElementById('result');
+
+      const url = input.value.trim();
+      if (!url) return;
+
+      errorEl.style.display = 'none';
+      resultEl.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = 'Shortening…';
+
+      try {
+        const res = await fetch('/api/v1/shorten', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.detail?.[0]?.msg || data.detail || 'Something went wrong');
+        }
+
+        const shortEl = document.getElementById('short-link');
+        shortEl.href = data.short_url;
+        shortEl.textContent = data.short_url;
+        resultEl.style.display = 'block';
+
+        addHistory(url, data.short_url);
+        input.value = '';
+      } catch (err) {
+        errorEl.textContent = err.message;
+        errorEl.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Shorten';
+      }
+    }
+
+    function copy() {
+      const url = document.getElementById('short-link').textContent;
+      navigator.clipboard.writeText(url).then(() => {
+        const btn = document.getElementById('copy-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+      });
+    }
+
+    function addHistory(original, short) {
+      history.unshift({ original, short });
+      if (history.length > 5) history.pop();
+      renderHistory();
+    }
+
+    function renderHistory() {
+      const container = document.getElementById('history');
+      const list = document.getElementById('history-list');
+      if (history.length === 0) { container.style.display = 'none'; return; }
+      container.style.display = 'block';
+      list.innerHTML = history.map(h => `
+        <div class="history-item">
+          <span class="history-original" title="${h.original}">${h.original}</span>
+          <a class="history-short" href="${h.short}" target="_blank">${h.short.split('/').pop()}</a>
+        </div>
+      `).join('');
+    }
+
+    document.getElementById('url-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') shorten();
+    });
+  </script>
+</body>
+</html>

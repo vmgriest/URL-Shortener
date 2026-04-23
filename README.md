@@ -1,8 +1,42 @@
 # URL Shortener
 
-A production-grade URL shortener built with **FastAPI + PostgreSQL + Redis**, fully containerised with Docker Compose and instrumented with Prometheus + Grafana.
+A production-grade URL shortener built with **FastAPI + PostgreSQL + Redis**, deployed to **AWS** with a fully serverless analytics pipeline. Includes a web UI, real-time click analytics, rate limiting, observability, and infrastructure-as-code.
 
-Designed to demonstrate real-world backend engineering: caching strategy, rate limiting, observability, and measurable performance — with hard numbers to back it up.
+---
+
+## Architecture
+
+### AWS deployment (production)
+
+```
+Browser
+   │
+   ▼
+Application Load Balancer
+   │
+   ▼
+ECS Fargate (FastAPI)
+   ├──► RDS PostgreSQL       — persistent URL storage
+   ├──► ElastiCache Redis    — in-memory redirect cache (~5ms hits)
+   └──► SQS (fire-and-forget on every redirect)
+              │
+              ▼
+           Lambda             — processes click events asynchronously
+              │
+              ▼
+           DynamoDB           — click analytics per short code
+```
+
+### Local development
+
+```
+Docker Compose
+  ├── app        FastAPI on port 8000
+  ├── postgres   PostgreSQL on port 5432
+  ├── redis      Redis on port 6379
+  ├── prometheus Metrics scraping on port 9090
+  └── grafana    Dashboard on port 3000
+```
 
 ---
 
@@ -14,17 +48,37 @@ POST /api/v1/shorten  ──►  FastAPI  ──►  PostgreSQL (persist URL)
                            returns short code
 
 GET  /{short_code}    ──►  FastAPI  ──►  Redis cache hit?  ──YES──►  302 redirect (~5ms)
-                                              │
-                                              NO
+                                              │                           │
+                                              NO                    SQS message ──► Lambda ──► DynamoDB
                                               │
                                          PostgreSQL lookup ──►  write to Redis  ──►  302 redirect (~40ms)
 
-GET  /metrics         ──►  Prometheus scrapes every 10s
-                                │
-                            Grafana dashboard (live graphs)
+GET  /api/v1/analytics/{code}  ──►  DynamoDB query  ──►  click count + recent visitors
 ```
 
-**The key insight:** After the first visit to any short link, every subsequent redirect is served entirely from Redis — PostgreSQL is never touched again. This is what drives the latency from ~40ms down to ~5ms.
+**The key insight:** After the first visit to any short link, every subsequent redirect is served entirely from Redis — PostgreSQL is never touched again. This drives latency from ~40ms down to ~5ms.
+
+Click analytics are written asynchronously: the redirect returns immediately and a background Lambda processes the event into DynamoDB, so analytics never add latency to the user's experience.
+
+---
+
+## AWS infrastructure (Terraform)
+
+All infrastructure is provisioned as code in the `terraform/` directory.
+
+| Resource | Service | Purpose |
+|---|---|---|
+| ECS Fargate | Compute | Runs the FastAPI container, auto-scales |
+| ECR | Registry | Stores Docker images |
+| RDS PostgreSQL 16 | Database | Persistent URL storage (db.t3.micro) |
+| ElastiCache Redis 7 | Cache | In-memory redirect cache (cache.t3.micro) |
+| Application Load Balancer | Networking | Health checks, traffic distribution |
+| SQS | Messaging | Decouples click events from redirect path |
+| Lambda (Python 3.12) | Serverless | Processes SQS click events |
+| DynamoDB | NoSQL | Click analytics (PAY_PER_REQUEST billing) |
+| CloudWatch | Observability | Container logs, 7-day retention |
+| IAM | Security | Least-privilege roles per service |
+| VPC | Networking | Public subnets (ALB + ECS), private subnets (RDS + Redis) |
 
 ---
 
@@ -44,18 +98,35 @@ User clicks link → FastAPI → Redis (in-memory lookup) → redirect
                                   ~5–12ms
 ```
 
-Redis is fast because it stores everything **in memory**, with no disk I/O and no query parsing. A hash lookup in Redis takes microseconds. The application caches each URL for 1 hour (`CACHE_TTL = 3600s`), so hot links stay warm automatically.
+Redis is fast because it stores everything **in memory**, with no disk I/O and no query parsing. The application caches each URL for 1 hour (`CACHE_TTL = 3600s`), so hot links stay warm automatically.
 
 At 500 req/s with a warm cache the p99 latency drops by **~75%** compared to always hitting the database.
 
 ---
 
+## Click analytics — serverless event pipeline
+
+Every redirect fires a message to SQS without waiting for a response (fire-and-forget). A Lambda function polls SQS in batches of 10 and writes each click event to DynamoDB with the short code, timestamp, IP, and user agent.
+
+```
+GET /fM3acY
+  → 302 redirect (immediate)
+  → SQS.send_message (async task, does not block response)
+       └── Lambda polls SQS
+              └── DynamoDB.put_item({short_code, timestamp, ip, user_agent})
+
+GET /api/v1/analytics/fM3acY
+  → {"short_code": "fM3acY", "total_clicks": 42, "recent_clicks": [...]}
+```
+
+This architecture means analytics are **never on the critical path** — a SQS or Lambda failure has zero impact on redirect performance.
+
+---
+
 ## Observability — what gets measured
 
-Every request is tracked across three layers:
-
-### 1. Structured JSON logs
-Every request emits a single JSON line to stdout:
+### 1. Structured JSON logs (CloudWatch)
+Every request emits a single JSON line:
 ```json
 {
   "message": "request",
@@ -66,10 +137,10 @@ Every request emits a single JSON line to stdout:
   "timestamp": "2024-01-15T10:23:45"
 }
 ```
-This makes logs searchable and parseable by any log aggregation tool (Datadog, Loki, CloudWatch).
+Logs stream to CloudWatch (`/ecs/url-shortener`) with 7-day retention.
 
 ### 2. Prometheus metrics
-The `/metrics` endpoint exposes these counters and histograms:
+The `/metrics` endpoint exposes:
 
 | Metric | Type | What it tells you |
 |---|---|---|
@@ -80,15 +151,8 @@ The `/metrics` endpoint exposes these counters and histograms:
 | `urls_created_total` | Counter | Total short URLs ever created |
 | `rate_limit_hits_total` | Counter | How many requests were blocked |
 
-### 3. Grafana dashboard
-Auto-provisioned at startup with 6 panels:
-
-- **Request rate** — requests per second over time
-- **P99 / P50 latency** — where the slowest 1% of requests land
-- **Cache hit rate %** — rises toward 100% as links warm up
-- **Error rate** — 4xx and 5xx responses per second
-- **Rate limit hits** — blocked request volume
-- **Total URLs created** — cumulative counter
+### 3. Grafana dashboard (local only)
+Auto-provisioned at startup with 6 panels: request rate, P99/P50 latency, cache hit rate, error rate, rate limit hits, URLs created.
 
 ---
 
@@ -122,45 +186,70 @@ Thresholds are enforced: the test **fails** if p99 exceeds 50ms in the baseline 
 
 ---
 
-## Installation
+## Deploying to AWS
 
-### 1. Install Docker Desktop
-Download from https://www.docker.com/products/docker-desktop
+### Prerequisites
+- AWS CLI configured (`aws configure`)
+- Terraform >= 1.0
+- Docker Desktop
 
-Verify:
+### First deploy
+
 ```bash
-docker --version
-docker compose version
+# 1. Create your variables file
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars and set db_password
+
+# 2. Initialise Terraform
+terraform init
+
+# 3. Create ECR first so you can push the image
+terraform apply "-target=aws_ecr_repository.app"
+
+# 4. Build and push the Docker image
+cd ..
+$token = aws ecr get-login-password --region us-east-1
+docker login --username AWS --password $token 241431497665.dkr.ecr.us-east-1.amazonaws.com
+docker build -t url-shortener .
+docker tag url-shortener:latest 241431497665.dkr.ecr.us-east-1.amazonaws.com/url-shortener:latest
+docker push 241431497665.dkr.ecr.us-east-1.amazonaws.com/url-shortener:latest
+
+# 5. Deploy everything (RDS takes ~5 minutes)
+cd terraform
+terraform apply
 ```
 
-### 2. Install k6
-**Windows:**
+### Redeploy after code changes
+
 ```bash
-winget install k6 --source winget
+docker build -t url-shortener .
+docker tag url-shortener:latest 241431497665.dkr.ecr.us-east-1.amazonaws.com/url-shortener:latest
+docker push 241431497665.dkr.ecr.us-east-1.amazonaws.com/url-shortener:latest
+aws ecs update-service --cluster url-shortener --service url-shortener --force-new-deployment --region us-east-1
 ```
-**macOS:**
+
+### Tear down
+
 ```bash
-brew install k6
+cd terraform
+terraform destroy
 ```
 
-### 3. Install Python (for running tests locally)
-Download Python 3.12 from https://www.python.org/downloads/
+Type `yes`. This shuts down all AWS resources (~$44/month while running). When you need it again, `terraform apply` brings everything back in ~7 minutes.
+
+### Commit and push changes
 
 ```bash
-python -m venv .venv
-
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-pip install -r requirements.txt
-pip install fakeredis aiosqlite
+cd ..
+git add .
+git commit -m "your message"
+git push
 ```
 
 ---
 
-## Running the project
+## Running locally
 
 ```bash
 cp .env.example .env
@@ -169,7 +258,7 @@ docker compose up --build
 
 | Service | URL |
 |---|---|
-| API | http://localhost:8000 |
+| App + UI | http://localhost:8000 |
 | Swagger docs | http://localhost:8000/docs |
 | Prometheus | http://localhost:9090 |
 | Grafana | http://localhost:3000 (admin / admin) |
@@ -186,11 +275,39 @@ docker compose down -v
 
 If `app-1` crashes on startup with `socket.gaierror: [Errno -2] Name or service not known`, the app container can't resolve the `postgres` hostname. This happens when stale containers from a previous run are left on a different Docker network.
 
-Fix with a clean restart:
-
 ```bash
 docker compose down --remove-orphans
 docker compose up --build
+```
+
+---
+
+## Installation (local development)
+
+### 1. Install Docker Desktop
+Download from https://www.docker.com/products/docker-desktop
+
+### 2. Install k6
+**Windows:**
+```bash
+winget install k6 --source winget
+```
+**macOS:**
+```bash
+brew install k6
+```
+
+### 3. Install Python (for running tests locally)
+```bash
+python -m venv .venv
+
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
+pip install -r requirements.txt
+pip install fakeredis aiosqlite
 ```
 
 ---
@@ -237,6 +354,20 @@ GET http://localhost:8000/api/v1/info/aB3xYz
 }
 ```
 
+### Click analytics (AWS only)
+```
+GET http://localhost:8000/api/v1/analytics/aB3xYz
+```
+```json
+{
+  "short_code": "aB3xYz",
+  "total_clicks": 42,
+  "recent_clicks": [
+    {"timestamp": "2024-01-15T10:23:45+00:00", "ip": "1.2.3.4", "user_agent": "Mozilla/5.0..."}
+  ]
+}
+```
+
 ---
 
 ## Running tests
@@ -263,7 +394,24 @@ pytest tests/ -v
 │   ├── crud.py            # Database operations
 │   ├── rate_limiter.py    # Token bucket rate limiter (Redis-backed)
 │   ├── metrics.py         # Prometheus counters + histograms
-│   └── utils.py           # Short code generator (base62, 6 chars)
+│   ├── utils.py           # Short code generator (base62, 6 chars)
+│   └── static/
+│       └── index.html     # Web UI
+├── lambda/
+│   └── click_processor.py # Lambda handler — SQS → DynamoDB
+├── terraform/             # All AWS infrastructure as code
+│   ├── main.tf            # Provider config
+│   ├── vpc.tf             # VPC, subnets, routing
+│   ├── ecs.tf             # ECS cluster, task, service
+│   ├── rds.tf             # RDS PostgreSQL
+│   ├── elasticache.tf     # ElastiCache Redis
+│   ├── alb.tf             # Application Load Balancer
+│   ├── sqs.tf             # SQS click events queue
+│   ├── lambda.tf          # Lambda function + SQS trigger
+│   ├── dynamodb.tf        # DynamoDB click events table
+│   ├── ecr.tf             # ECR container registry
+│   ├── iam.tf             # IAM roles and policies
+│   └── security_groups.tf # Security groups
 ├── tests/
 │   ├── test_api.py        # API integration tests (in-memory SQLite)
 │   └── test_rate_limiter.py # Rate limiter unit tests (fakeredis)

@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     base_url: str = "http://localhost:8000"
     rate_limit_capacity: int = 20
     rate_limit_refill_rate: float = 10.0
+    sqs_queue_url: str = ""   # set by ECS; empty disables click publishing locally
+    dynamodb_table: str = ""  # set by ECS; empty returns 501 on analytics endpoint
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

@@ -12,10 +12,17 @@ Endpoints:
 import logging
 import time
 import asyncio
+import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from functools import partial
+
+import boto3
+from boto3.dynamodb.conditions import Key
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pythonjsonlogger.jsonlogger import JsonFormatter
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +60,40 @@ rate_limiter = TokenBucketRateLimiter(
 
 CACHE_TTL = 3600  # seconds to cache redirects in Redis
 
+_sqs_client = None
+_dynamodb_resource = None
+
+
+def _get_sqs():
+    global _sqs_client
+    if _sqs_client is None:
+        _sqs_client = boto3.client("sqs")
+    return _sqs_client
+
+
+def _get_dynamodb():
+    global _dynamodb_resource
+    if _dynamodb_resource is None:
+        _dynamodb_resource = boto3.resource("dynamodb")
+    return _dynamodb_resource
+
+
+async def _publish_click(short_code: str, user_agent: str, ip: str) -> None:
+    msg = json.dumps({
+        "short_code": short_code,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_agent": user_agent,
+        "ip": ip,
+    })
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            partial(_get_sqs().send_message, QueueUrl=settings.sqs_queue_url, MessageBody=msg),
+        )
+    except Exception:
+        pass  # never let analytics break a redirect
+
 
 # ---------------------------------------------------------------------------
 # App lifespan: initialise DB tables and Redis on startup
@@ -68,6 +109,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="URL Shortener", version="1.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +140,8 @@ async def observe_requests(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/v1/info/"):
         path = "/api/v1/info/{short_code}"
+    elif path.startswith("/api/v1/analytics/"):
+        path = "/api/v1/analytics/{short_code}"
     elif path.startswith("/api/v1/"):
         pass  # keep as-is
     elif path not in ("/health", "/metrics"):
@@ -134,6 +178,11 @@ async def _increment_hit_bg(short_code: str) -> None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+@app.get("/", include_in_schema=False)
+async def index():
+    return FileResponse("app/static/index.html")
+
+
 @app.get("/health", tags=["ops"])
 async def health():
     return {"status": "ok"}
@@ -159,7 +208,7 @@ async def shorten_url(body: ShortenRequest, db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/{short_code}", tags=["urls"])
-async def redirect_url(short_code: str, db: AsyncSession = Depends(get_db)):
+async def redirect_url(short_code: str, request: Request, db: AsyncSession = Depends(get_db)):
     redis = await get_redis()
     cache_key = f"url:{short_code}"
 
@@ -169,6 +218,8 @@ async def redirect_url(short_code: str, db: AsyncSession = Depends(get_db)):
         cache_hits_total.labels(operation="redirect").inc()
         logger.info("cache hit", extra={"short_code": short_code})
         asyncio.create_task(_increment_hit_bg(short_code))
+        if settings.sqs_queue_url:
+            asyncio.create_task(_publish_click(short_code, request.headers.get("user-agent", ""), request.client.host if request.client else ""))
         return RedirectResponse(url=cached, status_code=status.HTTP_302_FOUND)
 
     cache_misses_total.labels(operation="redirect").inc()
@@ -181,6 +232,8 @@ async def redirect_url(short_code: str, db: AsyncSession = Depends(get_db)):
     # 3. Populate cache and fire hit counter without blocking the redirect
     await redis.set(cache_key, url_row.original_url, ex=CACHE_TTL)
     asyncio.create_task(_increment_hit_bg(short_code))
+    if settings.sqs_queue_url:
+        asyncio.create_task(_publish_click(short_code, request.headers.get("user-agent", ""), request.client.host if request.client else ""))
 
     logger.info("cache miss — served from db", extra={"short_code": short_code})
     return RedirectResponse(url=url_row.original_url, status_code=status.HTTP_302_FOUND)
@@ -192,3 +245,29 @@ async def url_info(short_code: str, db: AsyncSession = Depends(get_db)):
     if url_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Short code not found")
     return url_row
+
+
+@app.get("/api/v1/analytics/{short_code}", tags=["analytics"])
+async def url_analytics(short_code: str):
+    if not settings.dynamodb_table:
+        raise HTTPException(status_code=501, detail="Analytics not configured")
+    table = _get_dynamodb().Table(settings.dynamodb_table)
+    try:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            partial(
+                table.query,
+                KeyConditionExpression=Key("short_code").eq(short_code),
+                ScanIndexForward=False,
+                Limit=50,
+            ),
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Analytics unavailable")
+    items = response.get("Items", [])
+    return {
+        "short_code": short_code,
+        "total_clicks": response.get("Count", 0),
+        "recent_clicks": items[:10],
+    }
